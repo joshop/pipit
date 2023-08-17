@@ -180,3 +180,25 @@ def test_time_profile(data_dir, ping_pong_otf2_trace):
     assert np.isclose(norm.loc[61]["MPI_Comm_size"], 0.0)
     assert np.isclose(norm.loc[61]["MPI_Comm_rank"], 0.0)
     assert np.isclose(norm.loc[61]["MPI_Finalize"], 0.01614835)
+
+
+def generic_test_load_imbalance(trace):
+    load_imbalance = trace.load_imbalance(num_processes=2)
+
+    # check the size
+    assert len(load_imbalance) == len(
+        trace.events.loc[trace.events["Event Type"] == "Enter"]["Name"].unique()
+    )
+
+    # ensure that two processes reported as top for each
+    assert (load_imbalance["Top processes"].apply(len) == 2).all()
+
+    # ensure that all imbalance numbers are >= 1
+    assert (load_imbalance["time.exc.imbalance"] >= 1).all()
+
+
+def test_load_imbalance(data_dir, ping_pong_otf2_trace):
+    trace = Trace.from_otf2(str(ping_pong_otf2_trace))
+    trace.calc_exc_metrics(["Timestamp (ns)"])
+
+    generic_test_load_imbalance(trace)
