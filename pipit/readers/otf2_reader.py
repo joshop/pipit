@@ -13,9 +13,10 @@ import pipit.trace
 class OTF2Reader:
     """Reader for OTF2 trace files"""
 
-    def __init__(self, dir_name, num_processes=None):
+    def __init__(self, dir_name, num_processes=None, create_cct=False):
         self.dir_name = dir_name  # directory of otf2 file being read
         self.file_name = self.dir_name + "/traces.otf2"
+        self.create_cct = create_cct
 
         num_cpus = mp.cpu_count()
         if num_processes is None or num_processes < 1 or num_processes > num_cpus:
@@ -244,7 +245,7 @@ class OTF2Reader:
                 if str(loc.type)[13:] == "CPU_THREAD":
                     # don't add metric events as a separate row,
                     # and add their values into columns instead
-                    if type(event) == otf2.events.Metric:
+                    if isinstance(event, otf2.events.Metric):
                         # Since the location is a cpu thread, we know
                         # that the metric event is of type MetricClass,
                         # which has a list of MetricMembers.
@@ -315,9 +316,9 @@ class OTF2Reader:
                                 if value is not None and key != "time":
                                     # uses field_to_val to convert all data types
                                     # and ensure that there are no pickling errors
-                                    attributes_dict[
-                                        self.field_to_val(key)
-                                    ] = self.handle_data(value)
+                                    attributes_dict[self.field_to_val(key)] = (
+                                        self.handle_data(value)
+                                    )
                             event_attributes.append(attributes_dict)
                         else:
                             # nan attributes for leave rows
@@ -516,4 +517,8 @@ class OTF2Reader:
 
         self.events = self.read_events()  # events
 
-        return pipit.trace.Trace(self.definitions, self.events)
+        trace = pipit.trace.Trace(self.definitions, self.events)
+        if self.create_cct:
+            trace.create_cct()
+
+        return trace

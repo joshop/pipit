@@ -5,17 +5,20 @@
 
 import numpy as np
 import pandas as pd
+from pipit.util.cct import create_cct
 
 
 class Trace:
-    """A trace dataset is read into an object of this type, which includes one
-    or more dataframes.
+    """
+    A trace dataset is read into an object of this type, which
+    includes one or more dataframes and a calling context tree.
     """
 
-    def __init__(self, definitions, events):
+    def __init__(self, definitions, events, cct=None):
         """Create a new Trace object."""
         self.definitions = definitions
         self.events = events
+        self.cct = cct
 
         # list of numeric columns which we can calculate inc/exc metrics with
         self.numeric_cols = list(
@@ -26,13 +29,18 @@ class Trace:
         self.inc_metrics = []
         self.exc_metrics = []
 
+    def create_cct(self):
+        # adds a column of cct nodes to the events dataframe
+        # and stores the graph object in self.cct
+        self.cct = create_cct(self.events)
+
     @staticmethod
-    def from_otf2(dirname, num_processes=None):
+    def from_otf2(dirname, num_processes=None, create_cct=False):
         """Read an OTF2 trace into a new Trace object."""
         # import this lazily to avoid circular dependencies
         from .readers.otf2_reader import OTF2Reader
 
-        return OTF2Reader(dirname, num_processes).read()
+        return OTF2Reader(dirname, num_processes, create_cct).read()
 
     @staticmethod
     def from_hpctoolkit(dirname):
@@ -43,20 +51,20 @@ class Trace:
         return HPCToolkitReader(dirname).read()
 
     @staticmethod
-    def from_projections(dirname):
+    def from_projections(dirname, num_processes=None, create_cct=False):
         """Read a Projections trace into a new Trace object."""
         # import this lazily to avoid circular dependencies
         from .readers.projections_reader import ProjectionsReader
 
-        return ProjectionsReader(dirname).read()
+        return ProjectionsReader(dirname, num_processes, create_cct).read()
 
     @staticmethod
-    def from_nsight(filename):
+    def from_nsight(filename, create_cct=False):
         """Read an Nsight trace into a new Trace object."""
         # import this lazily to avoid circular dependencies
         from .readers.nsight_reader import NsightReader
 
-        return NsightReader(filename).read()
+        return NsightReader(filename, create_cct).read()
 
     @staticmethod
     def from_csv(filename):
@@ -87,6 +95,13 @@ class Trace:
         )
 
         return Trace(None, events_dataframe)
+
+    def to_chrome(self, filename=None):
+        """Export as Chrome Tracing JSON, which can be opened
+        in Perfetto."""
+        from .writers.chrome_writer import ChromeWriter
+
+        return ChromeWriter(self, filename).write()
 
     def _match_events(self):
         """Matches corresponding enter/leave events and adds two columns to the
@@ -354,7 +369,6 @@ class Trace:
         Communication Matrix for Peer-to-Peer (P2P) MPI messages
 
         Arguments:
-
         1) output -
         string to choose whether the communication volume should be measured
         by bytes transferred between two processes or the number of messages
@@ -440,7 +454,66 @@ class Trace:
 
         return np.histogram(sizes, bins=bins, **kwargs)
 
-    def flat_profile(self, metrics=None, groupby_column="Name", per_process=False):
+    def comm_over_time(self, output="size", message_type="send", bins=50, **kwargs):
+        """Returns histogram of communication volume over time.
+
+        Args:
+            output (str, optional). Whether to calculate communication by "count" or
+            "size". Defaults to "size".
+
+            message_type (str, optional): Whether to compute for sends or
+            receives. Defaults to "send".
+
+            bins (int, optional): Number of bins in the histogram. Defaults to
+            50.
+
+        Returns:
+            hist: Volume in size or number of messages in each time interval
+            edges: Edges of time intervals
+        """
+        # Filter by send or receive events
+        events = self.events[
+            self.events["Name"].isin(
+                ["MpiSend", "MpiIsend"]
+                if message_type == "send"
+                else ["MpiRecv", "MpiIrecv"]
+            )
+        ]
+
+        # Get timestamps and sizes
+        timestamps = events["Timestamp (ns)"]
+        sizes = events["Attributes"].apply(lambda x: x["msg_length"])
+
+        return np.histogram(
+            timestamps,
+            bins=bins,
+            weights=sizes.tolist() if output == "size" else None,
+            range=[
+                self.events["Timestamp (ns)"].min(),
+                self.events["Timestamp (ns)"].max(),
+            ],
+            **kwargs
+        )
+
+    def comm_by_process(self, output="size"):
+        """Returns total communication volume in size or number of messages per
+           process.
+
+        Returns:
+            pd.DataFrame: DataFrame containing total communication volume or
+            number of messags sent and received by each process.
+        """
+        comm_matrix = self.comm_matrix(output=output)
+
+        # Get total sent and received for each process
+        sent = comm_matrix.sum(axis=1)
+        received = comm_matrix.sum(axis=0)
+
+        return pd.DataFrame({"Sent": sent, "Received": received}).rename_axis("Process")
+
+    def flat_profile(
+        self, metrics="time.exc", groupby_column="Name", per_process=False
+    ):
         """
         Arguments:
         metrics - a string or list of strings containing the metrics to be aggregated
@@ -451,7 +524,15 @@ class Trace:
         for the grouped by columns.
         """
 
-        metrics = self.inc_metrics + self.exc_metrics if metrics is None else metrics
+        metrics = [metrics] if not isinstance(metrics, list) else metrics
+
+        # calculate inclusive time if needed
+        if "time.inc" in metrics:
+            self.calc_inc_metrics(["Timestamp (ns)"])
+
+        # calculate exclusive time if needed
+        if "time.exc" in metrics:
+            self.calc_exc_metrics(["Timestamp (ns)"])
 
         # This first groups by both the process and the specified groupby
         # column (like name). It then sums up the metrics for each combination
@@ -504,10 +585,14 @@ class Trace:
         for function in functions:
             curr_series = flat_profile.loc[function]
 
-            top_n = curr_series.sort_values(ascending=False).iloc[0:num_display]
+            top_n = curr_series.sort_values(by=metric, ascending=False).iloc[
+                0:num_display
+            ]
 
-            imbalance_dict[mean_metric].append(curr_series.mean())
-            imbalance_dict[imb_metric].append(top_n.values[0] / curr_series.mean())
+            imbalance_dict[mean_metric].append(curr_series.mean().values[0])
+            imbalance_dict[imb_metric].append(
+                (top_n.values[0] / curr_series.mean()).values[0]
+            )
             imbalance_dict[imb_ranks].append(list(top_n.index))
 
         imbalance_df = pd.DataFrame(imbalance_dict)
@@ -516,7 +601,7 @@ class Trace:
 
         return imbalance_df
 
-    def idle_time(self, idle_functions=["Idle"], MPI_events=False):
+    def idle_time(self, idle_functions=["Idle"], mpi_events=False):
         # dict for creating a new dataframe
         idle_times = {"Process": [], "Idle Time": []}
 
@@ -524,19 +609,19 @@ class Trace:
             idle_times["Process"].append(process)
             idle_times["Idle Time"].append(
                 self._calculate_idle_time_for_process(
-                    process, idle_functions, MPI_events
+                    process, idle_functions, mpi_events
                 )
             )
         return pd.DataFrame(idle_times)
 
     def _calculate_idle_time_for_process(
-        self, process, idle_functions=["Idle"], MPI_events=False
+        self, process, idle_functions=["Idle"], mpi_events=False
     ):
         # calculate inclusive metrics
         if "time.inc" not in self.events.columns:
             self.calc_inc_metrics()
 
-        if MPI_events:
+        if mpi_events:
             idle_functions += ["MPI_Wait", "MPI_Waitall", "MPI_Recv"]
         # filter the dataframe to include only 'Enter' events within the specified
         # process with the specified function names
@@ -681,3 +766,102 @@ class Trace:
         df.insert(0, "bin_end", edges[1:])
 
         return df
+
+    @staticmethod
+    def multirun_analysis(
+        traces, metric_column="Timestamp (ns)", groupby_column="Name"
+    ):
+        """
+        Arguments:
+        traces - list of pipit traces
+        metric_column - the column of the metric to be aggregated over
+        groupby_column - the column that will be grouped by before aggregation
+
+        Returns:
+        A Pandas DataFrame indexed by the number of processes in the traces, the
+        columns are the groups of the groupby_column, and the entries of the DataFrame
+        are the aggregated metrics corresponding to the respective trace and group
+        """
+
+        # for each trace, collect a flat profile
+        flat_profiles = []
+        for trace in traces:
+            trace.calc_exc_metrics([metric_column])
+            metric_col = (
+                "time.exc"
+                if metric_column == "Timestamp (ns)"
+                else metric_column + ".exc"
+            )
+            flat_profiles.append(
+                trace.flat_profile(metrics=[metric_col], groupby_column=groupby_column)
+            )
+
+        # combine these flat profiles and index them by number of processes
+        combined_df = pd.concat([fp[metric_col] for fp in flat_profiles], axis=1).T
+        combined_df.index = [len(set(trace.events["Process"])) for trace in traces]
+        combined_df.index.rename("Number of Processes", inplace=True)
+
+        # sort the columns/groups in descending order of the aggregated metric values
+        function_sums = combined_df.sum()
+        combined_df = combined_df[function_sums.sort_values(ascending=False).index]
+
+        return combined_df
+
+    def detect_pattern(
+        self,
+        start_event,
+        iterations=None,
+        window_size=None,
+        process=0,
+        metric="time.exc",
+    ):
+        import stumpy
+
+        enter_events = self.events[
+            (self.events["Name"] == start_event)
+            & (self.events["Event Type"] == "Enter")
+            & (self.events["Process"] == process)
+        ]
+
+        leave_events = self.events[
+            (self.events["Name"] == start_event)
+            & (self.events["Event Type"] == "Leave")
+            & (self.events["Process"] == process)
+        ]
+
+        # count the number of enter events to
+        # determine the number of iterations if it's not
+        # given by the user.
+        if iterations is None:
+            iterations = len(enter_events)
+
+        # get the first enter and last leave of
+        # the given event. we will only investigate
+        # this portion of the data.
+        first_loop_enter = enter_events.index[0]
+        last_loop_leave = leave_events.index[-1]
+
+        df = self.events.iloc[first_loop_enter + 1 : last_loop_leave]
+        filtered_df = df.loc[(df[metric].notnull()) & (df["Process"] == process)]
+        y = filtered_df[metric].values[:]
+
+        if window_size is None:
+            window_size = int(len(y) / iterations)
+
+        matrix_profile = stumpy.stump(y, window_size)
+        dists, indices = stumpy.motifs(y, matrix_profile[:, 0], max_matches=iterations)
+
+        # Gets the corresponding portion from the original
+        # dataframe for each pattern.
+        patterns = []
+        for idx in indices[0]:
+            end_idx = idx + window_size
+
+            match_original = self.events.loc[
+                self.events["Timestamp (ns)"].isin(
+                    filtered_df.iloc[idx:end_idx]["Timestamp (ns)"].values
+                )
+            ]
+            patterns.append(match_original)
+
+        return patterns
